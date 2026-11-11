@@ -5,11 +5,12 @@ import sqlite3
 
 from collections import defaultdict, deque
 from base64 import b64decode
+from datetime import datetime, timezone
 from threading import Lock
 from time import monotonic
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, make_response, request
+from flask import Flask, g, jsonify, make_response, request
 
 from backend.config import load_admin_config
 from backend.db import DATABASE_PATH, connect_database
@@ -181,6 +182,9 @@ def _clear_failed_logins(ip_address):
 
 def create_app(test_config=None):
     """Create and configure the ResQTech Flask application."""
+
+    # Local import avoids the auth.py -> app.py circular import.
+    from backend.auth import require_roles
 
     app = Flask(__name__)
 
@@ -484,6 +488,207 @@ def create_app(test_config=None):
                 "Unable to complete organization registration.",
                 500,
             )
+
+        finally:
+            connection.close()
+
+    @app.route("/resource", methods=["POST"])
+    @require_roles("ORGANIZATION")
+    def create_resource():
+        """Register a resource for the authenticated organization."""
+
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            return jsonify({
+                "error": "INVALID_REQUEST",
+                "message": "A JSON request body is required.",
+            }), 400
+
+        allowed_fields = {
+            "resource_type",
+            "base_location_id",
+            "status",
+        }
+
+        if set(data) != allowed_fields:
+            return jsonify({
+                "error": "INVALID_REQUEST",
+                "message": (
+                    "Exactly resource_type, base_location_id "
+                    "and status must be provided."
+                ),
+            }), 400
+
+        resource_types = {
+            "AMBULANCE",
+            "FIRE_VEHICLE",
+            "POLICE_UNIT",
+            "RESCUE_VEHICLE",
+        }
+
+        # REQUESTED and DISPATCHED belong to the allocation lifecycle.
+        # INACTIVE is handled by the resource deactivation lifecycle.
+        initial_statuses = {"AVAILABLE", "UNAVAILABLE"}
+
+        resource_type = data["resource_type"]
+        base_location_id = data["base_location_id"]
+        status = data["status"]
+
+        if (
+            not isinstance(resource_type, str)
+            or resource_type not in resource_types
+        ):
+            return jsonify({
+                "error": "INVALID_RESOURCE_TYPE",
+                "message": "The resource type is not supported.",
+            }), 400
+
+        if (
+            not isinstance(base_location_id, str)
+            or not base_location_id.strip()
+        ):
+            return jsonify({
+                "error": "INVALID_BASE_LOCATION",
+                "message": "A valid base location is required.",
+            }), 400
+
+        base_location_id = base_location_id.strip()
+
+        if (
+            not isinstance(status, str)
+            or status not in initial_statuses
+        ):
+            return jsonify({
+                "error": "INVALID_RESOURCE_STATUS",
+                "message": (
+                    "Initial status must be AVAILABLE or UNAVAILABLE."
+                ),
+            }), 400
+
+        organization_id = g.resqtech_principal["organization_id"]
+        db_path = app.config["DATABASE_PATH"]
+        connection = connect_database(db_path)
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+
+            organization = connection.execute(
+                """
+                SELECT status
+                FROM Organizations
+                WHERE organization_id = ?
+                """,
+                (organization_id,),
+            ).fetchone()
+
+            if organization is None or organization["status"] != "ACTIVE":
+                connection.rollback()
+
+                return jsonify({
+                    "error": "NOT_ACTIVE",
+                    "message": "The organization is not active.",
+                }), 409
+
+            location = connection.execute(
+                """
+                SELECT 1
+                FROM Locations
+                WHERE location_id = ?
+                """,
+                (base_location_id,),
+            ).fetchone()
+
+            if location is None:
+                connection.rollback()
+
+                return jsonify({
+                    "error": "LOCATION_NOT_FOUND",
+                    "message": "The specified base location does not exist.",
+                }), 404
+
+            last_updated = (
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+
+            resource_id = None
+
+            for _ in range(3):
+                candidate_id = f"res_{secrets.token_hex(8)}"
+
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO Resources (
+                            resource_id,
+                            organization_id,
+                            resource_type,
+                            base_location_id,
+                            last_reported_location_id,
+                            status,
+                            last_updated
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            candidate_id,
+                            organization_id,
+                            resource_type,
+                            base_location_id,
+                            base_location_id,
+                            status,
+                            last_updated,
+                        ),
+                    )
+
+                    resource_id = candidate_id
+                    break
+
+                except sqlite3.IntegrityError:
+                    existing = connection.execute(
+                        """
+                        SELECT 1
+                        FROM Resources
+                        WHERE resource_id = ?
+                        """,
+                        (candidate_id,),
+                    ).fetchone()
+
+                    if existing is None:
+                        raise
+
+            if resource_id is None:
+                connection.rollback()
+
+                return jsonify({
+                    "error": "RESOURCE_REGISTRATION_UNAVAILABLE",
+                    "message": "Unable to generate a unique resource ID.",
+                }), 500
+
+            connection.commit()
+
+            return jsonify({
+                "resource_id": resource_id,
+                "resource_type": resource_type,
+                "base_location_id": base_location_id,
+                "last_reported_location_id": base_location_id,
+                "status": status,
+                "last_updated": last_updated,
+            }), 201
+
+        except sqlite3.Error:
+            connection.rollback()
+
+            app.logger.exception(
+                "Resource registration database failure."
+            )
+
+            return jsonify({
+                "error": "RESOURCE_REGISTRATION_UNAVAILABLE",
+                "message": "Unable to register the resource.",
+            }), 500
 
         finally:
             connection.close()
