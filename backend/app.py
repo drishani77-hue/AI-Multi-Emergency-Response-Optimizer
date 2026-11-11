@@ -1,0 +1,448 @@
+
+from collections import defaultdict, deque
+from base64 import b64decode
+from threading import Lock
+from time import monotonic
+from urllib.parse import urlsplit
+
+from flask import Flask, jsonify, make_response, request
+
+from backend.config import load_admin_config
+from backend.db import DATABASE_PATH, connect_database
+from backend.security import verify_password
+from backend.sessions import (
+    create_session,
+    get_active_session,
+    revoke_session,
+    verify_session_csrf,
+)
+
+
+SESSION_COOKIE = "resqtech_session"
+CSRF_COOKIE = "resqtech_csrf"
+SESSION_MAX_AGE = 8 * 60 * 60
+
+RATE_LIMIT_ATTEMPTS = 5
+RATE_LIMIT_WINDOW = 15 * 60
+
+_failed_attempts = defaultdict(deque)
+_rate_limit_lock = Lock()
+
+
+def _valid_password_hash(encoded_hash):
+    """Validate the configured PBKDF2 hash format and parameters."""
+
+    if not isinstance(encoded_hash, str):
+        return False
+
+    parts = encoded_hash.split("$")
+
+    if len(parts) != 4:
+        return False
+
+    algorithm, iterations, salt_text, digest_text = parts
+
+    if algorithm != "pbkdf2_sha256" or iterations != "600000":
+        return False
+
+    try:
+        salt = b64decode(salt_text, validate=True)
+        digest = b64decode(digest_text, validate=True)
+    except Exception:
+        return False
+
+    return (
+        len(salt) == 16
+        and len(digest) == 32
+        and bool(salt_text)
+        and bool(digest_text)
+    )
+
+
+def _validate_frontend_origin(origin):
+    """Reject invalid or non-origin frontend configuration."""
+
+    if not isinstance(origin, str) or not origin.strip():
+        raise RuntimeError("RESQTECH_FRONTEND_ORIGIN is required.")
+
+    parsed = urlsplit(origin)
+
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or origin != origin.strip()
+    ):
+        raise RuntimeError("RESQTECH_FRONTEND_ORIGIN is invalid.")
+
+    return origin.rstrip("/")
+
+
+def _validate_admin_configuration(db_path):
+    """Fail startup if Admin configuration conflicts with the database."""
+
+    admin = load_admin_config()
+
+    if not _valid_password_hash(admin.password_hash):
+        raise RuntimeError(
+            "Configured Admin password hash has an invalid format."
+        )
+
+    connection = connect_database(db_path)
+
+    try:
+        collision = connection.execute(
+            """
+            SELECT 1
+            FROM Organizations
+            WHERE lower(trim(email)) = ?
+            LIMIT 1
+            """,
+            (admin.email,),
+        ).fetchone()
+
+        if collision is not None:
+            raise RuntimeError(
+                "Admin email conflicts with a registered organization."
+            )
+    finally:
+        connection.close()
+
+    return admin
+
+
+def _is_rate_limited(ip_address):
+    """Check the process-local rolling login failure window."""
+
+    now = monotonic()
+
+    with _rate_limit_lock:
+        attempts = _failed_attempts[ip_address]
+
+        while attempts and now - attempts[0] >= RATE_LIMIT_WINDOW:
+            attempts.popleft()
+
+        return len(attempts) >= RATE_LIMIT_ATTEMPTS
+
+
+def _record_failed_login(ip_address):
+    now = monotonic()
+
+    with _rate_limit_lock:
+        attempts = _failed_attempts[ip_address]
+
+        while attempts and now - attempts[0] >= RATE_LIMIT_WINDOW:
+            attempts.popleft()
+
+        attempts.append(now)
+
+
+def _clear_failed_logins(ip_address):
+    with _rate_limit_lock:
+        _failed_attempts.pop(ip_address, None)
+
+
+def create_app(test_config=None):
+    """Create and configure the ResQTech Flask application."""
+
+    app = Flask(__name__)
+
+    app.config.update(
+        DATABASE_PATH=DATABASE_PATH,
+        FRONTEND_ORIGIN=None,
+        SESSION_COOKIE_SECURE=None,
+    )
+
+    if test_config:
+        app.config.update(test_config)
+
+    if app.config["FRONTEND_ORIGIN"] is None:
+        import os
+
+        app.config["FRONTEND_ORIGIN"] = os.environ.get(
+            "RESQTECH_FRONTEND_ORIGIN",
+            "http://localhost:5173",
+        )
+
+    app.config["FRONTEND_ORIGIN"] = _validate_frontend_origin(
+        app.config["FRONTEND_ORIGIN"]
+    )
+
+    admin = _validate_admin_configuration(
+        app.config["DATABASE_PATH"]
+    )
+
+    app.extensions["resqtech_admin"] = admin
+
+    @app.before_request
+    def validate_request_origin():
+        """Validate Origin on all state-changing browser requests."""
+
+        if request.method == "OPTIONS":
+            return None
+
+        if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+            return None
+
+        origin = request.headers.get("Origin")
+
+        if origin != app.config["FRONTEND_ORIGIN"]:
+            return jsonify({
+                "error": "INVALID_ORIGIN",
+                "message": "Request origin is not permitted.",
+            }), 403
+
+        return None
+
+    @app.after_request
+    def add_cors_headers(response):
+        """Allow credentialed requests from the configured origin only."""
+
+        origin = request.headers.get("Origin")
+
+        if origin == app.config["FRONTEND_ORIGIN"]:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, X-CSRF-Token"
+            )
+            response.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            )
+            response.headers.add("Vary", "Origin")
+
+        return response
+
+    @app.route("/auth/login", methods=["POST"])
+    def login():
+        """Authenticate an organization or the configured Admin."""
+
+        ip_address = request.remote_addr or "unknown"
+
+        if _is_rate_limited(ip_address):
+            return jsonify({
+                "error": "RATE_LIMITED",
+                "message": "Too many failed login attempts. Try again later.",
+            }), 429
+
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            return jsonify({
+                "error": "INVALID_REQUEST",
+                "message": "A JSON request body is required.",
+            }), 400
+
+        email = data.get("email")
+        password = data.get("password")
+
+        if (
+            not isinstance(email, str)
+            or not isinstance(password, str)
+            or not email.strip()
+            or not password
+        ):
+            return jsonify({
+                "error": "INVALID_REQUEST",
+                "message": "Email and password are required.",
+            }), 400
+
+        email = email.strip().lower()
+
+        if len(email) > 254 or len(password) > 128:
+            _record_failed_login(ip_address)
+            return jsonify({
+                "error": "INVALID_CREDENTIALS",
+                "message": "Invalid email or password.",
+            }), 401
+
+        db_path = app.config["DATABASE_PATH"]
+        principal_type = None
+        principal_id = None
+        organization_id = None
+        identity = None
+
+        # Check the configured Admin account first.
+        if email == admin.email:
+            if verify_password(password, admin.password_hash):
+                principal_type = "ADMIN"
+                principal_id = admin.admin_id
+                identity = {
+                    "admin_id": admin.admin_id,
+                }
+
+        else:
+            connection = connect_database(db_path)
+
+            try:
+                organization = connection.execute(
+                    """
+                    SELECT
+                        organization_id,
+                        name,
+                        status,
+                        password_hash
+                    FROM Organizations
+                    WHERE lower(trim(email)) = ?
+                    LIMIT 1
+                    """,
+                    (email,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+            if organization is not None:
+                password_matches = verify_password(
+                    password,
+                    organization["password_hash"],
+                )
+
+                if (
+                    password_matches
+                    and organization["status"] == "ACTIVE"
+                ):
+                    principal_type = "ORGANIZATION"
+                    principal_id = organization["organization_id"]
+                    organization_id = organization["organization_id"]
+
+                    identity = {
+                        "organization_id": organization["organization_id"],
+                        "name": organization["name"],
+                    }
+
+        if principal_type is None:
+            _record_failed_login(ip_address)
+
+            return jsonify({
+                "error": "INVALID_CREDENTIALS",
+                "message": "Invalid email or password.",
+            }), 401
+
+        try:
+            tokens = create_session(
+                principal_type=principal_type,
+                principal_id=principal_id,
+                organization_id=organization_id,
+                db_path=db_path,
+            )
+        except Exception:
+            app.logger.exception("Session creation failed.")
+
+            return jsonify({
+                "error": "AUTHENTICATION_UNAVAILABLE",
+                "message": "Unable to complete login.",
+            }), 500
+
+        _clear_failed_logins(ip_address)
+
+        response_data = {"role": principal_type}
+
+        if principal_type == "ORGANIZATION":
+            response_data["organization"] = identity
+        else:
+            response_data["admin"] = identity
+
+        response = make_response(jsonify(response_data), 200)
+
+        secure_cookie = (
+            request.is_secure
+            if app.config["SESSION_COOKIE_SECURE"] is None
+            else app.config["SESSION_COOKIE_SECURE"]
+        )
+
+        response.set_cookie(
+            SESSION_COOKIE,
+            tokens["session_token"],
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            secure=secure_cookie,
+            samesite="Lax",
+            path="/",
+        )
+
+        response.set_cookie(
+            CSRF_COOKIE,
+            tokens["csrf_token"],
+            max_age=SESSION_MAX_AGE,
+            httponly=False,
+            secure=secure_cookie,
+            samesite="Lax",
+            path="/",
+        )
+
+        return response
+
+    @app.route("/auth/logout", methods=["POST"])
+    def logout():
+        """Revoke the current session after CSRF verification."""
+
+        session_token = request.cookies.get(SESSION_COOKIE)
+        csrf_token = request.headers.get("X-CSRF-Token")
+        db_path = app.config["DATABASE_PATH"]
+
+        if not session_token:
+            return jsonify({
+                "error": "UNAUTHENTICATED",
+                "message": "Authentication is required.",
+            }), 401
+
+        active_session = get_active_session(
+            session_token,
+            db_path,
+        )
+
+        if active_session is None:
+            return jsonify({
+                "error": "UNAUTHENTICATED",
+                "message": "Authentication is required.",
+            }), 401
+
+        if not csrf_token or not verify_session_csrf(
+            session_token,
+            csrf_token,
+            db_path,
+        ):
+            return jsonify({
+                "error": "INVALID_CSRF_TOKEN",
+                "message": "CSRF verification failed.",
+            }), 403
+
+        if not revoke_session(session_token, db_path):
+            return jsonify({
+                "error": "LOGOUT_FAILED",
+                "message": "Unable to revoke the session.",
+            }), 500
+
+        response = make_response(jsonify({"ok": True}), 200)
+
+        secure_cookie = (
+            request.is_secure
+            if app.config["SESSION_COOKIE_SECURE"] is None
+            else app.config["SESSION_COOKIE_SECURE"]
+        )
+
+        response.set_cookie(
+            SESSION_COOKIE,
+            "",
+            max_age=0,
+            httponly=True,
+            secure=secure_cookie,
+            samesite="Lax",
+            path="/",
+        )
+
+        response.set_cookie(
+            CSRF_COOKIE,
+            "",
+            max_age=0,
+            httponly=False,
+            secure=secure_cookie,
+            samesite="Lax",
+            path="/",
+        )
+
+        return response
+
+    return app
