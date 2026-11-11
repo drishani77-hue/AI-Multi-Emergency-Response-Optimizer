@@ -49,3 +49,9 @@ coverage/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Temporary OSM processing cache
+/cache/
+
+# Decompressed OSM source (regenerated from .osm.gz)
+/data/osm/*.osm
