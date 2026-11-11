@@ -1,4 +1,8 @@
 
+import re
+import secrets
+import sqlite3
+
 from collections import defaultdict, deque
 from base64 import b64decode
 from threading import Lock
@@ -9,7 +13,11 @@ from flask import Flask, jsonify, make_response, request
 
 from backend.config import load_admin_config
 from backend.db import DATABASE_PATH, connect_database
-from backend.security import verify_password
+from backend.security import (
+    hash_password,
+    validate_password,
+    verify_password,
+)
 from backend.sessions import (
     create_session,
     get_active_session,
@@ -25,8 +33,35 @@ SESSION_MAX_AGE = 8 * 60 * 60
 RATE_LIMIT_ATTEMPTS = 5
 RATE_LIMIT_WINDOW = 15 * 60
 
+ORGANIZATION_TYPES = {
+    "HOSPITAL_MEDICAL",
+    "FIRE_SERVICE",
+    "POLICE_SECURITY",
+    "RESCUE_DISASTER_RESPONSE",
+}
+
+ORGANIZATION_OWNERSHIPS = {
+    "GOVERNMENT",
+    "PRIVATE",
+}
+
+EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+
 _failed_attempts = defaultdict(deque)
 _rate_limit_lock = Lock()
+
+
+def _registration_error(error, message, status):
+    """Return a consistent organization-registration error."""
+
+    return jsonify({
+        "error": error,
+        "message": message,
+    }), status
 
 
 def _valid_password_hash(encoded_hash):
@@ -214,6 +249,244 @@ def create_app(test_config=None):
             response.headers.add("Vary", "Origin")
 
         return response
+
+    @app.route("/organization", methods=["POST"])
+    def register_organization():
+        """Register an organization without automatically logging it in."""
+
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            return _registration_error(
+                "INVALID_REQUEST",
+                "A JSON request body is required.",
+                400,
+            )
+
+        allowed_fields = {
+            "name",
+            "organization_type",
+            "ownership",
+            "phone",
+            "email",
+            "password",
+        }
+
+        required_fields = {
+            "name",
+            "organization_type",
+            "ownership",
+            "email",
+            "password",
+        }
+
+        if set(data) - allowed_fields:
+            return _registration_error(
+                "INVALID_REQUEST",
+                "The request contains unsupported fields.",
+                400,
+            )
+
+        if not required_fields.issubset(data):
+            return _registration_error(
+                "INVALID_REQUEST",
+                "All required organization fields must be provided.",
+                400,
+            )
+
+        for field in required_fields:
+            if not isinstance(data[field], str):
+                return _registration_error(
+                    "INVALID_REQUEST",
+                    f"{field} must be a string.",
+                    400,
+                )
+
+        name = data["name"].strip()
+        organization_type = data["organization_type"]
+        ownership = data["ownership"]
+        email = data["email"].strip().lower()
+        password = data["password"]
+
+        phone = data.get("phone")
+
+        if phone is not None:
+            if not isinstance(phone, str):
+                return _registration_error(
+                    "INVALID_REQUEST",
+                    "phone must be a string.",
+                    400,
+                )
+
+            phone = phone.strip() or None
+
+        if not name:
+            return _registration_error(
+                "INVALID_REQUEST",
+                "Organization name cannot be empty.",
+                400,
+            )
+
+        if organization_type not in ORGANIZATION_TYPES:
+            return _registration_error(
+                "INVALID_ORGANIZATION_TYPE",
+                "The selected organization type is not supported.",
+                400,
+            )
+
+        if ownership not in ORGANIZATION_OWNERSHIPS:
+            return _registration_error(
+                "INVALID_OWNERSHIP",
+                "Ownership must be GOVERNMENT or PRIVATE.",
+                400,
+            )
+
+        if (
+            not email
+            or len(email) > 254
+            or not email.isascii()
+            or not EMAIL_PATTERN.fullmatch(email)
+        ):
+            return _registration_error(
+                "INVALID_EMAIL",
+                "A valid ASCII email address is required.",
+                400,
+            )
+
+        try:
+            validate_password(password)
+        except (TypeError, ValueError):
+            return _registration_error(
+                "INVALID_PASSWORD",
+                "Password must contain between 12 and 128 characters.",
+                400,
+            )
+
+        if email == admin.email:
+            return _registration_error(
+                "EMAIL_ALREADY_REGISTERED",
+                "This email address is already registered.",
+                409,
+            )
+
+        db_path = app.config["DATABASE_PATH"]
+        connection = connect_database(db_path)
+
+        try:
+            existing = connection.execute(
+                """
+                SELECT 1
+                FROM Organizations
+                WHERE lower(trim(email)) = ?
+                LIMIT 1
+                """,
+                (email,),
+            ).fetchone()
+
+            if existing is not None:
+                return _registration_error(
+                    "EMAIL_ALREADY_REGISTERED",
+                    "This email address is already registered.",
+                    409,
+                )
+
+            password_hash = hash_password(password)
+
+            for attempt in range(3):
+                organization_id = f"org_{secrets.token_hex(8)}"
+
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+
+                    connection.execute(
+                        """
+                        INSERT INTO Organizations (
+                            organization_id,
+                            name,
+                            organization_type,
+                            ownership,
+                            phone,
+                            email,
+                            password_hash,
+                            status
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+                        """,
+                        (
+                            organization_id,
+                            name,
+                            organization_type,
+                            ownership,
+                            phone,
+                            email,
+                            password_hash,
+                        ),
+                    )
+
+                    connection.commit()
+
+                    return jsonify({
+                        "organization_id": organization_id,
+                        "name": name,
+                        "status": "ACTIVE",
+                    }), 201
+
+                except sqlite3.IntegrityError:
+                    connection.rollback()
+
+                    existing = connection.execute(
+                        """
+                        SELECT 1
+                        FROM Organizations
+                        WHERE lower(trim(email)) = ?
+                        LIMIT 1
+                        """,
+                        (email,),
+                    ).fetchone()
+
+                    if existing is not None:
+                        return _registration_error(
+                            "EMAIL_ALREADY_REGISTERED",
+                            "This email address is already registered.",
+                            409,
+                        )
+
+                    if attempt == 2:
+                        app.logger.exception(
+                            "Organization registration integrity failure."
+                        )
+
+                except sqlite3.Error:
+                    connection.rollback()
+                    app.logger.exception(
+                        "Organization registration database failure."
+                    )
+
+                    return _registration_error(
+                        "REGISTRATION_UNAVAILABLE",
+                        "Unable to complete organization registration.",
+                        500,
+                    )
+
+            return _registration_error(
+                "REGISTRATION_UNAVAILABLE",
+                "Unable to generate a unique organization ID.",
+                500,
+            )
+
+        except sqlite3.Error:
+            app.logger.exception(
+                "Organization registration database failure."
+            )
+
+            return _registration_error(
+                "REGISTRATION_UNAVAILABLE",
+                "Unable to complete organization registration.",
+                500,
+            )
+
+        finally:
+            connection.close()
 
     @app.route("/auth/login", methods=["POST"])
     def login():
