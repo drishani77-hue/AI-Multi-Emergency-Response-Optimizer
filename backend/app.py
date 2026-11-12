@@ -1361,29 +1361,6 @@ def create_app(test_config=None):
                         ),
                     )
 
-                    connection.execute(
-                        """
-                        INSERT INTO Allocation_Decision_Events (
-                            event_id,
-                            emergency_id,
-                            requirement_unit_id,
-                            resource_id,
-                            event_type,
-                            event_time,
-                            distance_km,
-                            reason
-                        )
-                        VALUES (?, ?, ?, NULL, 'PENDING_STARTED', ?, NULL, ?)
-                        """,
-                        (
-                            f"evt_{secrets.token_hex(8)}",
-                            emergency_id,
-                            unit_id,
-                            reported_at,
-                            "Initial resource requirement created.",
-                        ),
-                    )
-
             connection.commit()
 
             return jsonify({
