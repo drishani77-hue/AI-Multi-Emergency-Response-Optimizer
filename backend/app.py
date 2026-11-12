@@ -3,9 +3,13 @@ import re
 import secrets
 import sqlite3
 
+import json
+import uuid
+
+from datetime import datetime, timedelta, timezone
+from backend.emergency_triage import evaluate_emergency
 from collections import defaultdict, deque
 from base64 import b64decode
-from datetime import datetime, timezone
 from threading import Lock
 from time import monotonic
 from urllib.parse import urlsplit
@@ -54,7 +58,29 @@ EMAIL_PATTERN = re.compile(
 
 _failed_attempts = defaultdict(deque)
 _rate_limit_lock = Lock()
+_road_engine_init_lock = Lock()
 
+
+def get_road_engine(app):
+    """Return the application's shared road engine, initializing it once."""
+
+    engine = app.extensions.get("resqtech_road_engine")
+
+    if engine is not None:
+        return engine
+
+    with _road_engine_init_lock:
+        engine = app.extensions.get("resqtech_road_engine")
+
+        if engine is not None:
+            return engine
+
+        from backend.road_engine import RoadEngine
+
+        engine = RoadEngine()
+        app.extensions["resqtech_road_engine"] = engine
+
+        return engine
 
 def _registration_error(error, message, status):
     """Return a consistent organization-registration error."""
@@ -922,5 +948,553 @@ def create_app(test_config=None):
         )
 
         return response
+    @app.route("/emergency", methods=["POST"])
+    def report_emergency():
+        """Accept and persist a citizen or bystander emergency report."""
 
+        data = request.get_json(silent=True)
+
+        def error_response(error, message, status):
+            return jsonify({
+                "error": error,
+                "message": message,
+            }), status
+
+        if not isinstance(data, dict):
+            return error_response(
+                "INVALID_REQUEST",
+                "A JSON request body is required.",
+                400,
+            )
+
+        allowed_fields = {
+            "emergency_type",
+            "location_id",
+            "location_text",
+            "assessment_answers",
+            "description",
+            "reporter_name",
+            "reporter_phone",
+            "reporter_type",
+            "additional_details",
+            "idempotency_key",
+        }
+
+        if set(data) - allowed_fields:
+            return error_response(
+                "INVALID_REQUEST",
+                "The request contains unsupported fields.",
+                400,
+            )
+
+        required_fields = {
+            "emergency_type",
+            "location_text",
+            "assessment_answers",
+            "description",
+            "reporter_name",
+            "reporter_phone",
+            "reporter_type",
+            "idempotency_key",
+        }
+
+        if not required_fields.issubset(data):
+            return error_response(
+                "INVALID_REQUEST",
+                "All required emergency-report fields must be provided.",
+                400,
+            )
+
+        text_fields = (
+            "emergency_type",
+            "location_text",
+            "description",
+            "reporter_name",
+            "reporter_phone",
+            "reporter_type",
+            "idempotency_key",
+        )
+
+        if any(not isinstance(data[field], str) for field in text_fields):
+            return error_response(
+                "INVALID_REQUEST",
+                "Text fields must contain strings.",
+                400,
+            )
+
+        emergency_type = data["emergency_type"].strip().upper()
+        location_text = data["location_text"].strip()
+        description = data["description"].strip()
+        reporter_name = data["reporter_name"].strip()
+        reporter_type = data["reporter_type"].strip().upper()
+        idempotency_key = data["idempotency_key"].strip()
+
+        additional_details = data.get("additional_details", "")
+
+        if additional_details is None:
+            additional_details = ""
+
+        if not isinstance(additional_details, str):
+            return error_response(
+                "INVALID_REQUEST",
+                "additional_details must be a string.",
+                400,
+            )
+
+        additional_details = additional_details.strip()
+
+        if not isinstance(data["assessment_answers"], dict):
+            return error_response(
+                "INVALID_ASSESSMENT",
+                "assessment_answers must be a JSON object.",
+                400,
+            )
+
+        supported_types = {
+            "MEDICAL_EMERGENCY",
+            "FIRE",
+            "ROAD_TRAFFIC_ACCIDENT",
+            "THREAT_TO_LIFE_VIOLENCE",
+            "TRAPPED_PERSON_RESCUE",
+        }
+
+        supported_reporter_types = {
+            "CITIZEN",
+            "BYSTANDER",
+            "AUTHORIZED_EMERGENCY_OPERATOR",
+        }
+
+        if emergency_type not in supported_types:
+            return error_response(
+                "INVALID_EMERGENCY_TYPE",
+                "The emergency type is not supported.",
+                400,
+            )
+
+        if reporter_type not in supported_reporter_types:
+            return error_response(
+                "INVALID_REPORTER_TYPE",
+                "The reporter type is not supported.",
+                400,
+            )
+
+        try:
+            uuid.UUID(idempotency_key)
+        except (ValueError, AttributeError):
+            return error_response(
+                "INVALID_IDEMPOTENCY_KEY",
+                "A valid UUID idempotency key is required.",
+                400,
+            )
+
+        word_count = len(description.split())
+
+        if not 5 <= word_count <= 300:
+            return error_response(
+                "INVALID_DESCRIPTION",
+                "Description must contain between 5 and 300 words.",
+                400,
+            )
+
+        if not location_text or not reporter_name:
+            return error_response(
+                "INVALID_REQUEST",
+                "Location and reporter name cannot be empty.",
+                400,
+            )
+
+        if len(reporter_name) > 150 or len(location_text) > 500:
+            return error_response(
+                "INVALID_REQUEST",
+                "A text field exceeds its permitted length.",
+                400,
+            )
+
+        phone = reporter_phone = data["reporter_phone"].strip()
+
+        phone = re.sub(r"[ ()-]", "", phone)
+
+        if phone.startswith("+91"):
+            phone = phone[3:]
+
+        if not re.fullmatch(r"[0-9]{10}", phone):
+            return error_response(
+                "INVALID_PHONE",
+                "Enter a valid 10-digit Indian phone number.",
+                400,
+            )
+
+        location_id = data.get("location_id")
+
+        if location_id is not None:
+            if not isinstance(location_id, str) or not location_id.strip():
+                return error_response(
+                    "INVALID_LOCATION",
+                    "location_id must be a non-empty string or null.",
+                    400,
+                )
+
+            location_id = location_id.strip()
+
+        answers = data["assessment_answers"]
+
+        try:
+            triage = evaluate_emergency(emergency_type, answers)
+        except (TypeError, ValueError, KeyError) as exc:
+            return error_response(
+                "INVALID_ASSESSMENT",
+                str(exc),
+                400,
+            )
+
+        normalized_answers = triage["assessment_answers"]
+
+        answers_json = json.dumps(
+            normalized_answers,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        db_path = app.config["DATABASE_PATH"]
+        connection = connect_database(db_path)
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+
+            resolved_location_id = None
+            location_resolved = 0
+
+            if location_id is not None:
+                location = connection.execute(
+                    """
+                    SELECT location_id, road_node_id
+                    FROM Locations
+                    WHERE location_id = ?
+                    """,
+                    (location_id,),
+                ).fetchone()
+
+                if location is not None and location["road_node_id"]:
+                    resolved_location_id = location["location_id"]
+                    location_resolved = 1
+
+            canonical_payload = {
+                "emergency_type": emergency_type,
+                "location_id": resolved_location_id,
+                "location_text": location_text,
+                "assessment_answers": normalized_answers,
+                "description": description,
+                "reporter_name": reporter_name,
+                "reporter_phone": phone,
+                "reporter_type": reporter_type,
+                "additional_details": additional_details,
+            }
+
+            existing = connection.execute(
+                """
+                SELECT
+                    emergency_id,
+                    emergency_type,
+                    location_id,
+                    location_text,
+                    assessment_answers_json,
+                    description,
+                    reporter_name,
+                    reporter_phone,
+                    reporter_type,
+                    additional_details,
+                    location_resolved,
+                    severity,
+                    assessment_uncertain,
+                    reported_at
+                FROM Emergencies
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
+            if existing is not None:
+                stored_payload = {
+                    "emergency_type": existing["emergency_type"],
+                    "location_id": existing["location_id"],
+                    "location_text": existing["location_text"],
+                    "assessment_answers": json.loads(
+                        existing["assessment_answers_json"]
+                    ),
+                    "description": existing["description"],
+                    "reporter_name": existing["reporter_name"],
+                    "reporter_phone": existing["reporter_phone"],
+                    "reporter_type": existing["reporter_type"],
+                    "additional_details": existing["additional_details"],
+                }
+
+                if stored_payload != canonical_payload:
+                    connection.rollback()
+
+                    return error_response(
+                        "IDEMPOTENCY_KEY_CONFLICT",
+                        "This idempotency key was already used for a different report.",
+                        409,
+                    )
+
+                connection.commit()
+
+                return jsonify({
+                    "emergency_id": existing["emergency_id"],
+                    "status": "PENDING",
+                    "severity": existing["severity"],
+                    "assessment_uncertain": bool(
+                        existing["assessment_uncertain"]
+                    ),
+                    "location_resolved": bool(
+                        existing["location_resolved"]
+                    ),
+                    "reported_at": existing["reported_at"],
+                    "message": "Emergency report received.",
+                }), 200
+
+            reported_at = (
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+
+            emergency_id = f"emg_{secrets.token_hex(8)}"
+
+            connection.execute(
+                """
+                INSERT INTO Emergencies (
+                    emergency_id,
+                    emergency_type,
+                    severity,
+                    location_id,
+                    additional_details,
+                    description,
+                    reporter_name,
+                    reporter_phone,
+                    reporter_type,
+                    reported_at,
+                    status,
+                    data_source,
+                    idempotency_key,
+                    location_text,
+                    location_resolved,
+                    assessment_answers_json,
+                    assessment_uncertain,
+                    assessment_reasons,
+                    severity_rule_version
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'PENDING', 'OPERATIONAL', ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    emergency_id,
+                    emergency_type,
+                    triage["severity"],
+                    resolved_location_id,
+                    additional_details,
+                    description,
+                    reporter_name,
+                    phone,
+                    reporter_type,
+                    reported_at,
+                    idempotency_key,
+                    location_text,
+                    location_resolved,
+                    answers_json,
+                    int(triage["assessment_uncertain"]),
+                    json.dumps(triage["assessment_reasons"]),
+                    triage["severity_rule_version"],
+                ),
+            )
+
+            requirements = triage["requirements"]
+
+            expires_at = (
+                datetime.strptime(
+                    reported_at, "%Y-%m-%dT%H:%M:%SZ"
+                ) + timedelta(seconds=30)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            for resource_type, quantity in sorted(requirements.items()):
+                if quantity <= 0:
+                    continue
+
+                group_id = f"rg_{secrets.token_hex(8)}"
+
+                connection.execute(
+                    """
+                    INSERT INTO Requirement_Groups (
+                        requirement_group_id,
+                        emergency_id,
+                        resource_type,
+                        quantity_required,
+                        status
+                    )
+                    VALUES (?, ?, ?, ?, 'PENDING')
+                    """,
+                    (
+                        group_id,
+                        emergency_id,
+                        resource_type,
+                        quantity,
+                    ),
+                )
+
+                for unit_number in range(1, quantity + 1):
+                    unit_id = f"ru_{secrets.token_hex(8)}"
+
+                    pending_since = reported_at
+
+
+                    connection.execute(
+                        """
+                        INSERT INTO Requirement_Units (
+                            requirement_unit_id,
+                            requirement_group_id,
+                            unit_number,
+                            resource_type,
+                            status,
+                            pending_since,
+                            expires_at
+                        )
+                        VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
+                        """,
+                        (
+                            unit_id,
+                            group_id,
+                            unit_number,
+                            resource_type,
+                            pending_since,
+                            expires_at,
+                        ),
+                    )
+
+                    connection.execute(
+                        """
+                        INSERT INTO Allocation_Decision_Events (
+                            event_id,
+                            emergency_id,
+                            requirement_unit_id,
+                            resource_id,
+                            event_type,
+                            event_time,
+                            distance_km,
+                            reason
+                        )
+                        VALUES (?, ?, ?, NULL, 'PENDING_STARTED', ?, NULL, ?)
+                        """,
+                        (
+                            f"evt_{secrets.token_hex(8)}",
+                            emergency_id,
+                            unit_id,
+                            reported_at,
+                            "Initial resource requirement created.",
+                        ),
+                    )
+
+            connection.commit()
+
+            return jsonify({
+                "emergency_id": emergency_id,
+                "status": "PENDING",
+                "severity": triage["severity"],
+                "assessment_uncertain": bool(
+                    triage["assessment_uncertain"]
+                ),
+                "location_resolved": bool(location_resolved),
+                "reported_at": reported_at,
+                "message": "Emergency report received.",
+            }), 201
+
+        except sqlite3.IntegrityError:
+            connection.rollback()
+
+            # Check whether another request created this idempotency key.
+            existing = connection.execute(
+                """
+                SELECT
+                    emergency_id,
+                    emergency_type,
+                    location_id,
+                    location_text,
+                    assessment_answers_json,
+                    description,
+                    reporter_name,
+                    reporter_phone,
+                    reporter_type,
+                    additional_details,
+                    location_resolved,
+                    severity,
+                    assessment_uncertain,
+                    reported_at
+                FROM Emergencies
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
+            if existing is not None:
+                stored_payload = {
+                    "emergency_type": existing["emergency_type"],
+                    "location_id": existing["location_id"],
+                    "location_text": existing["location_text"],
+                    "assessment_answers": json.loads(
+                        existing["assessment_answers_json"]
+                    ),
+                    "description": existing["description"],
+                    "reporter_name": existing["reporter_name"],
+                    "reporter_phone": existing["reporter_phone"],
+                    "reporter_type": existing["reporter_type"],
+                    "additional_details": existing["additional_details"],
+                }
+
+                if stored_payload != canonical_payload:
+                    return error_response(
+                        "IDEMPOTENCY_KEY_CONFLICT",
+                        "This idempotency key was already used for a different report.",
+                        409,
+                    )
+
+                return jsonify({
+                    "emergency_id": existing["emergency_id"],
+                    "status": "PENDING",
+                    "severity": existing["severity"],
+                    "assessment_uncertain": bool(
+                        existing["assessment_uncertain"]
+                    ),
+                    "location_resolved": bool(
+                        existing["location_resolved"]
+                    ),
+                    "reported_at": existing["reported_at"],
+                    "message": "Emergency report received.",
+                }), 200
+
+            app.logger.exception(
+                "Emergency report integrity failure."
+            )
+
+            return error_response(
+                "EMERGENCY_REPORT_UNAVAILABLE",
+                "Unable to save the emergency report.",
+                500,
+            )
+
+        except sqlite3.Error:
+            connection.rollback()
+
+            app.logger.exception(
+                "Emergency report database failure."
+            )
+
+            return error_response(
+                "EMERGENCY_REPORT_UNAVAILABLE",
+                "Unable to save the emergency report.",
+                500,
+            )
+
+        finally:
+            connection.close()
     return app

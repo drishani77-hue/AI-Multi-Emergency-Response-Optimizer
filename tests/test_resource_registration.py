@@ -467,3 +467,135 @@ def test_resource_registration_does_not_trust_client_organization_id(
 
     assert resource_count == 0
 
+def test_emergency_report_unresolved_location_idempotent_retry(
+    client,
+):
+    payload = {
+        "emergency_type": "MEDICAL_EMERGENCY",
+        "location_id": "LOC001",
+        "location_text": (
+            "Dehradun, Clement Town, Graphic Era University Gate 1"
+        ),
+        "assessment_answers": {},
+        "description": (
+            "A person needs urgent medical assistance near "
+            "the university gate."
+        ),
+        "reporter_name": "Test Reporter",
+        "reporter_phone": "9876543210",
+        "reporter_type": "CITIZEN",
+        "idempotency_key": "12345678-1234-4234-8234-123456789abc",
+    }
+
+    first_response = client.post(
+    "/emergency",
+    json=payload,
+    headers={"Origin": FRONTEND_ORIGIN},
+    )
+
+    assert first_response.status_code == 201
+
+    first_data = first_response.get_json()
+
+    assert first_data["status"] == "PENDING"
+    assert first_data["location_resolved"] is False
+    assert first_data["emergency_id"]
+
+    retry_response = client.post(
+    "/emergency",
+    json=payload,
+    headers={"Origin": FRONTEND_ORIGIN},
+    )
+
+    assert retry_response.status_code == 200
+
+    retry_data = retry_response.get_json()
+
+    assert retry_data["emergency_id"] == first_data["emergency_id"]
+    assert retry_data["reported_at"] == first_data["reported_at"]
+
+    conflicting_payload = {
+        **payload,
+        "description": (
+            "A different emergency report with changed details "
+            "near the university gate."
+        ),
+    }
+
+    conflict_response = client.post(
+        "/emergency",
+        json=conflicting_payload,
+        headers={"Origin": FRONTEND_ORIGIN},
+    )
+
+    assert conflict_response.status_code == 409
+    assert (
+        conflict_response.get_json()["error"]
+        == "IDEMPOTENCY_KEY_CONFLICT"
+    )
+
+def test_emergency_requirement_units_share_one_deadline(
+    client,
+    db_path,
+):
+    payload = {
+        "emergency_type": "FIRE",
+        "location_id": "LOC001",
+        "location_text": (
+            "Dehradun, Clement Town, Graphic Era University Gate 1"
+        ),
+        "assessment_answers": {},
+        "description": (
+            "A fire has been reported near the university gate. "
+            "Emergency assistance is required."
+        ),
+        "reporter_name": "Test Reporter",
+        "reporter_phone": "9876543210",
+        "reporter_type": "CITIZEN",
+        "idempotency_key": "22345678-1234-4234-8234-123456789abc",
+    }
+
+    response = client.post(
+        "/emergency",
+        json=payload,
+        headers={"Origin": FRONTEND_ORIGIN},
+    )
+
+    assert response.status_code == 201
+
+    emergency_id = response.get_json()["emergency_id"]
+
+    connection = sqlite3.connect(db_path)
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT pending_since, expires_at
+            FROM Requirement_Units
+            WHERE requirement_group_id IN (
+                SELECT requirement_group_id
+                FROM Requirement_Groups
+                WHERE emergency_id = ?
+            )
+            """,
+            (emergency_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert len(rows) >= 2
+
+    pending_times = {row[0] for row in rows}
+    expiry_times = {row[1] for row in rows}
+
+    assert len(pending_times) == 1
+    assert len(expiry_times) == 1
+
+    pending_time = datetime.strptime(
+        rows[0][0], "%Y-%m-%dT%H:%M:%SZ"
+    )
+    expiry_time = datetime.strptime(
+        rows[0][1], "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    assert (expiry_time - pending_time).total_seconds() == 30
