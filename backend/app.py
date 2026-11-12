@@ -1312,12 +1312,6 @@ def create_app(test_config=None):
 
             requirements = triage["requirements"]
 
-            expires_at = (
-                datetime.strptime(
-                    reported_at, "%Y-%m-%dT%H:%M:%SZ"
-                ) + timedelta(seconds=30)
-            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
             for resource_type, quantity in sorted(requirements.items()):
                 if quantity <= 0:
                     continue
@@ -1346,9 +1340,6 @@ def create_app(test_config=None):
                 for unit_number in range(1, quantity + 1):
                     unit_id = f"ru_{secrets.token_hex(8)}"
 
-                    pending_since = reported_at
-
-
                     connection.execute(
                         """
                         INSERT INTO Requirement_Units (
@@ -1360,15 +1351,13 @@ def create_app(test_config=None):
                             pending_since,
                             expires_at
                         )
-                        VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
+                        VALUES (?, ?, ?, ?, 'PENDING', NULL, NULL)
                         """,
                         (
                             unit_id,
                             group_id,
                             unit_number,
                             resource_type,
-                            pending_since,
-                            expires_at,
                         ),
                     )
 

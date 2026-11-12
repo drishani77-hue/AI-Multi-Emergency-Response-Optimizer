@@ -534,7 +534,7 @@ def test_emergency_report_unresolved_location_idempotent_retry(
         == "IDEMPOTENCY_KEY_CONFLICT"
     )
 
-def test_emergency_requirement_units_share_one_deadline(
+def test_new_emergency_requirement_units_have_no_pending_episode(
     client,
     db_path,
 ):
@@ -570,7 +570,7 @@ def test_emergency_requirement_units_share_one_deadline(
     try:
         rows = connection.execute(
             """
-            SELECT pending_since, expires_at
+            SELECT pending_since, expires_at, episode_count
             FROM Requirement_Units
             WHERE requirement_group_id IN (
                 SELECT requirement_group_id
@@ -585,17 +585,9 @@ def test_emergency_requirement_units_share_one_deadline(
 
     assert len(rows) >= 2
 
-    pending_times = {row[0] for row in rows}
-    expiry_times = {row[1] for row in rows}
-
-    assert len(pending_times) == 1
-    assert len(expiry_times) == 1
-
-    pending_time = datetime.strptime(
-        rows[0][0], "%Y-%m-%dT%H:%M:%SZ"
+    assert all(
+        pending_since is None
+        and expires_at is None
+        and episode_count == 0
+        for pending_since, expires_at, episode_count in rows
     )
-    expiry_time = datetime.strptime(
-        rows[0][1], "%Y-%m-%dT%H:%M:%SZ"
-    )
-
-    assert (expiry_time - pending_time).total_seconds() == 30
