@@ -82,6 +82,32 @@ def get_road_engine(app):
 
         return engine
 
+
+_allocation_coordinator_init_lock = Lock()
+
+
+def get_allocation_coordinator(app):
+    """Return the application's shared allocation coordinator."""
+
+    coordinator = app.extensions.get("resqtech_allocation_coordinator")
+    if coordinator is not None:
+        return coordinator
+
+    with _allocation_coordinator_init_lock:
+        coordinator = app.extensions.get("resqtech_allocation_coordinator")
+        if coordinator is not None:
+            return coordinator
+
+        from backend.allocation_coordinator import AllocationCoordinator
+
+        coordinator = AllocationCoordinator(
+            app.config["DATABASE_PATH"],
+            get_road_engine(app),
+        )
+        app.extensions["resqtech_allocation_coordinator"] = coordinator
+        return coordinator
+
+
 def _registration_error(error, message, status):
     """Return a consistent organization-registration error."""
 
@@ -1463,4 +1489,361 @@ def create_app(test_config=None):
 
         finally:
             connection.close()
+
+    # Allocation API: organization-scoped request handling and history.
+
+    def _allocation_error(error, message, status):
+        return jsonify({"error": error, "message": message}), status
+
+    def _allocation_json_body(allowed_fields):
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return None, _allocation_error(
+                "INVALID_REQUEST", "A JSON request body is required.", 400
+            )
+        if set(data) - allowed_fields:
+            return None, _allocation_error(
+                "INVALID_REQUEST", "The request contains unsupported fields.", 400
+            )
+        allocation_id = data.get("allocation_id")
+        if not isinstance(allocation_id, str) or not allocation_id.strip():
+            return None, _allocation_error(
+                "INVALID_REQUEST", "allocation_id must be a non-empty string.", 400
+            )
+        data["allocation_id"] = allocation_id.strip()
+        return data, None
+
+    def _allocation_current_state(allocation_id, organization_id):
+        connection = connect_database(app.config["DATABASE_PATH"])
+        try:
+            return connection.execute(
+                """
+                SELECT a.status, a.response_status,
+                       ru.status AS requirement_unit_status,
+                       r.status AS resource_status
+                FROM Allocations a
+                JOIN Resources r ON r.resource_id = a.resource_id
+                JOIN Requirement_Units ru
+                  ON ru.requirement_unit_id = a.requirement_unit_id
+                WHERE a.allocation_id = ?
+                  AND r.organization_id = ?
+                """,
+                (allocation_id, organization_id),
+            ).fetchone()
+        finally:
+            connection.close()
+
+    def _allocation_coordinator_error(result):
+        code = result.get("code", "ALLOCATION_ERROR")
+        if code == "ALLOCATION_NOT_FOUND":
+            return _allocation_error(
+                "NOT_FOUND", "Allocation not found.", 404
+            )
+        if code == "ALLOCATION_EXPIRED":
+            return _allocation_error(
+                "ALLOCATION_EXPIRED", "The allocation response deadline has passed.", 409
+            )
+        if code in {"ALLOCATION_NOT_PENDING", "ALLOCATION_NOT_DISPATCHED"}:
+            return _allocation_error(
+                "ILLEGAL_STATE_TRANSITION",
+                "The allocation is not in a state that permits this action.",
+                409,
+            )
+        return _allocation_error(
+            "ALLOCATION_CONFLICT", "The allocation could not be updated.", 409
+        )
+
+    @app.route("/organization/requests", methods=["GET"])
+    @require_roles("ORGANIZATION")
+    def organization_requests():
+        organization_id = g.resqtech_principal["organization_id"]
+        connection = connect_database(app.config["DATABASE_PATH"])
+        try:
+            rows = connection.execute(
+                """
+                SELECT a.allocation_id, a.emergency_id,
+                       em.emergency_type, em.severity,
+                       loc.district, loc.locality, loc.specific_location,
+                       em.location_text, em.location_resolved,
+                       em.description, ru.resource_type,
+                       a.distance_km, a.requested_at, a.deadline_at,
+                       a.status, a.response_status
+                FROM Allocations a
+                JOIN Resources r ON r.resource_id = a.resource_id
+                JOIN Requirement_Units ru
+                  ON ru.requirement_unit_id = a.requirement_unit_id
+                JOIN Requirement_Groups rg
+                  ON rg.requirement_group_id = ru.requirement_group_id
+                JOIN Emergencies em ON em.emergency_id = a.emergency_id
+                LEFT JOIN Locations loc ON loc.location_id = em.location_id
+                WHERE r.organization_id = ?
+                  AND a.status = 'REQUESTED'
+                  AND a.response_status = 'PENDING'
+                ORDER BY a.requested_at ASC, a.allocation_id ASC
+                """,
+                (organization_id,),
+            ).fetchall()
+
+            return jsonify({
+                "items": [
+                    {
+                        "allocation_id": row["allocation_id"],
+                        "emergency_id": row["emergency_id"],
+                        "emergency_type": row["emergency_type"],
+                        "severity": row["severity"],
+                        "location": {
+                            "district": row["district"],
+                            "locality": row["locality"],
+                            "specific_location": (
+                                row["specific_location"] or row["location_text"]
+                            ),
+                        },
+                        "description": row["description"],
+                        "resource_type": row["resource_type"],
+                        "distance_km": row["distance_km"],
+                        "requested_at": row["requested_at"],
+                        "deadline_at": row["deadline_at"],
+                        "status": row["status"],
+                        "response_status": row["response_status"],
+                    }
+                    for row in rows
+                ]
+            })
+        finally:
+            connection.close()
+
+    @app.route("/organization/history", methods=["GET"])
+    @require_roles("ORGANIZATION")
+    def organization_history():
+        allowed_params = {"final_status", "from", "to", "page", "page_size"}
+        if set(request.args.keys()) - allowed_params:
+            return _allocation_error(
+                "INVALID_QUERY", "The request contains unsupported query parameters.", 400
+            )
+
+        try:
+            page = int(request.args.get("page", "1"))
+            page_size = int(request.args.get("page_size", "25"))
+            if page < 1 or not 1 <= page_size <= 100:
+                raise ValueError
+        except (TypeError, ValueError):
+            return _allocation_error(
+                "INVALID_QUERY", "page must be positive and page_size must be 1?100.", 400
+            )
+
+        final_status = request.args.get("final_status")
+        allowed_statuses = {"COMPLETED", "FAILED", "REJECTED", "TIMEOUT", "CANCELLED"}
+        if final_status is not None and final_status not in allowed_statuses:
+            return _allocation_error(
+                "INVALID_QUERY", "final_status is not supported.", 400
+            )
+
+        date_from = request.args.get("from")
+        date_to = request.args.get("to")
+        for value in (date_from, date_to):
+            if value is not None:
+                try:
+                    datetime.strptime(value, "%Y-%m-%d")
+                except ValueError:
+                    return _allocation_error(
+                        "INVALID_QUERY", "Dates must use YYYY-MM-DD format.", 400
+                    )
+        if date_from and date_to and date_from > date_to:
+            return _allocation_error(
+                "INVALID_QUERY", "The from date cannot be after the to date.", 400
+            )
+
+        final_status_sql = """
+            CASE
+                WHEN a.status IN ('COMPLETED', 'FAILED') THEN a.status
+                ELSE a.response_status
+            END
+        """
+        conditions = [
+            "r.organization_id = ?",
+            "a.status IN ('COMPLETED', 'FAILED', 'CLOSED')",
+        ]
+        params = [g.resqtech_principal["organization_id"]]
+
+        if final_status:
+            conditions.append(f"{final_status_sql} = ?")
+            params.append(final_status)
+        if date_from:
+            conditions.append("date(a.requested_at) >= date(?)")
+            params.append(date_from)
+        if date_to:
+            conditions.append("date(a.requested_at) <= date(?)")
+            params.append(date_to)
+
+        where_sql = " AND ".join(conditions)
+        connection = connect_database(app.config["DATABASE_PATH"])
+        try:
+            total = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM Allocations a
+                JOIN Resources r ON r.resource_id = a.resource_id
+                WHERE {where_sql}
+                """,
+                params,
+            ).fetchone()[0]
+
+            rows = connection.execute(
+                f"""
+                SELECT a.allocation_id, a.emergency_id, a.resource_id,
+                       {final_status_sql} AS final_status,
+                       a.requested_at, a.dispatched_at,
+                       a.completed_at, a.returned_at
+                FROM Allocations a
+                JOIN Resources r ON r.resource_id = a.resource_id
+                WHERE {where_sql}
+                ORDER BY a.requested_at DESC, a.allocation_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+
+            return jsonify({
+                "items": [dict(row) for row in rows],
+                "page": page,
+                "page_size": page_size,
+                "total_items": total,
+                "total_pages": (total + page_size - 1) // page_size,
+            })
+        finally:
+            connection.close()
+
+    @app.route("/allocation/accept", methods=["POST"])
+    @require_roles("ORGANIZATION")
+    def accept_allocation():
+        data, error = _allocation_json_body({"allocation_id"})
+        if error:
+            return error
+
+        organization_id = g.resqtech_principal["organization_id"]
+        try:
+            result = get_allocation_coordinator(app).organization_response(
+                data["allocation_id"], organization_id, accept=True
+            )
+            if not result.get("ok"):
+                return _allocation_coordinator_error(result)
+
+            state = _allocation_current_state(data["allocation_id"], organization_id)
+            if state is None:
+                return _allocation_error("NOT_FOUND", "Allocation not found.", 404)
+
+            return jsonify({
+                "allocation_id": data["allocation_id"],
+                "status": state["status"],
+                "response_status": state["response_status"],
+                "requirement_unit_status": state["requirement_unit_status"],
+                "resource_status": state["resource_status"],
+            })
+        except sqlite3.Error:
+            app.logger.exception("Database error while accepting allocation.")
+            return _allocation_error("ALLOCATION_UNAVAILABLE", "Unable to accept allocation.", 500)
+
+    @app.route("/allocation/reject", methods=["POST"])
+    @require_roles("ORGANIZATION")
+    def reject_allocation():
+        data, error = _allocation_json_body({"allocation_id", "reason"})
+        if error:
+            return error
+
+        reason = data.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            return _allocation_error("INVALID_REQUEST", "reason must be a string.", 400)
+        reason = (reason or "Organization declined the request.").strip()
+        if not reason:
+            reason = "Organization declined the request."
+
+        organization_id = g.resqtech_principal["organization_id"]
+        try:
+            result = get_allocation_coordinator(app).organization_response(
+                data["allocation_id"], organization_id,
+                accept=False, reason=reason,
+            )
+            if not result.get("ok"):
+                return _allocation_coordinator_error(result)
+
+            state = _allocation_current_state(data["allocation_id"], organization_id)
+            if state is None:
+                return _allocation_error("NOT_FOUND", "Allocation not found.", 404)
+
+            return jsonify({
+                "allocation_id": data["allocation_id"],
+                "status": state["status"],
+                "response_status": state["response_status"],
+                "requirement_unit_status": state["requirement_unit_status"],
+            })
+        except sqlite3.Error:
+            app.logger.exception("Database error while rejecting allocation.")
+            return _allocation_error("ALLOCATION_UNAVAILABLE", "Unable to reject allocation.", 500)
+
+    @app.route("/allocation/complete", methods=["POST"])
+    @require_roles("ORGANIZATION")
+    def complete_allocation():
+        data, error = _allocation_json_body({"allocation_id"})
+        if error:
+            return error
+
+        organization_id = g.resqtech_principal["organization_id"]
+        try:
+            result = get_allocation_coordinator(app).complete_allocation(
+                data["allocation_id"], organization_id
+            )
+            if not result.get("ok"):
+                return _allocation_coordinator_error(result)
+
+            state = _allocation_current_state(data["allocation_id"], organization_id)
+            if state is None:
+                return _allocation_error("NOT_FOUND", "Allocation not found.", 404)
+
+            return jsonify({
+                "allocation_id": data["allocation_id"],
+                "status": state["status"],
+                "response_status": state["response_status"],
+                "requirement_unit_status": state["requirement_unit_status"],
+                "resource_status": state["resource_status"],
+            })
+        except sqlite3.Error:
+            app.logger.exception("Database error while completing allocation.")
+            return _allocation_error("ALLOCATION_UNAVAILABLE", "Unable to complete allocation.", 500)
+
+    @app.route("/allocation/failure", methods=["POST"])
+    @require_roles("ORGANIZATION")
+    def fail_allocation():
+        data, error = _allocation_json_body({"allocation_id", "reason"})
+        if error:
+            return error
+
+        reason = data.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return _allocation_error(
+                "INVALID_REQUEST", "A non-empty failure reason is required.", 400
+            )
+
+        organization_id = g.resqtech_principal["organization_id"]
+        try:
+            result = get_allocation_coordinator(app).fail_allocation(
+                data["allocation_id"], organization_id, reason.strip()
+            )
+            if not result.get("ok"):
+                return _allocation_coordinator_error(result)
+
+            state = _allocation_current_state(data["allocation_id"], organization_id)
+            if state is None:
+                return _allocation_error("NOT_FOUND", "Allocation not found.", 404)
+
+            return jsonify({
+                "allocation_id": data["allocation_id"],
+                "status": state["status"],
+                "response_status": state["response_status"],
+                "requirement_unit_status": state["requirement_unit_status"],
+                "resource_status": state["resource_status"],
+            })
+        except sqlite3.Error:
+            app.logger.exception("Database error while failing allocation.")
+            return _allocation_error("ALLOCATION_UNAVAILABLE", "Unable to record allocation failure.", 500)
+
     return app

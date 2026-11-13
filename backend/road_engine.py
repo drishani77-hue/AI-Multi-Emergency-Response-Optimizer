@@ -1,6 +1,8 @@
-﻿from __future__ import annotations
+﻿
+from __future__ import annotations
 
 import ctypes
+import threading
 from pathlib import Path
 
 
@@ -49,20 +51,25 @@ class RoadEngine:
 
         self._configure_functions()
 
+        self._lock = threading.RLock()
+        self._handle = None
+
         error_buffer = ctypes.create_string_buffer(512)
 
-        self._handle = self._dll.resqtech_engine_create(
+        handle = self._dll.resqtech_engine_create(
             str(self.nodes_path).encode("utf-8"),
             str(self.edges_path).encode("utf-8"),
             error_buffer,
             ctypes.sizeof(error_buffer),
         )
 
-        if not self._handle:
+        if not handle:
             message = error_buffer.value.decode("utf-8", errors="replace")
             raise RoadEngineError(
                 message or "Native road engine initialization failed."
             )
+
+        self._handle = handle
 
     def _configure_functions(self) -> None:
         dll = self._dll
@@ -115,13 +122,15 @@ class RoadEngine:
 
     @property
     def node_count(self) -> int:
-        self._ensure_open()
-        return int(self._dll.resqtech_engine_node_count(self._handle))
+        with self._lock:
+            self._ensure_open()
+            return int(self._dll.resqtech_engine_node_count(self._handle))
 
     @property
     def edge_count(self) -> int:
-        self._ensure_open()
-        return int(self._dll.resqtech_engine_edge_count(self._handle))
+        with self._lock:
+            self._ensure_open()
+            return int(self._dll.resqtech_engine_edge_count(self._handle))
 
     def _ensure_open(self) -> None:
         if not self._handle:
@@ -136,8 +145,6 @@ class RoadEngine:
         source_osm_id: int,
         destination_osm_id: int,
     ) -> dict:
-        self._ensure_open()
-
         if (
             isinstance(source_osm_id, bool)
             or not isinstance(source_osm_id, int)
@@ -156,55 +163,60 @@ class RoadEngine:
                 "destination_osm_id must be a valid unsigned 64-bit integer."
             )
 
-        route_pointer = ctypes.POINTER(ctypes.c_uint64)()
-        route_count = ctypes.c_size_t()
-        total_distance = ctypes.c_double()
-        error_buffer = ctypes.create_string_buffer(512)
+        with self._lock:
+            self._ensure_open()
 
-        status = self._dll.resqtech_engine_route(
-            self._handle,
-            source_osm_id,
-            destination_osm_id,
-            ctypes.byref(route_pointer),
-            ctypes.byref(route_count),
-            ctypes.byref(total_distance),
-            error_buffer,
-            ctypes.sizeof(error_buffer),
-        )
+            route_pointer = ctypes.POINTER(ctypes.c_uint64)()
+            route_count = ctypes.c_size_t()
+            total_distance = ctypes.c_double()
+            error_buffer = ctypes.create_string_buffer(512)
 
-        if status != self.OK:
-            message = self._error_message(error_buffer)
-            if status == self.NODE_NOT_FOUND:
-                raise ValueError(message or "An OSM node was not found.")
-            if status == self.NO_PATH:
-                raise RoadEngineError(message or "No directed road route exists.")
-            if status == self.MEMORY_ERROR:
-                raise MemoryError(message or "Route allocation failed.")
-            raise RoadEngineError(message or f"Route operation failed: {status}")
+            status = self._dll.resqtech_engine_route(
+                self._handle,
+                source_osm_id,
+                destination_osm_id,
+                ctypes.byref(route_pointer),
+                ctypes.byref(route_count),
+                ctypes.byref(total_distance),
+                error_buffer,
+                ctypes.sizeof(error_buffer),
+            )
 
-        try:
-            nodes = [
-                int(route_pointer[index])
-                for index in range(route_count.value)
-            ]
-        finally:
-            if route_pointer:
-                self._dll.resqtech_free(route_pointer)
+            if status != self.OK:
+                message = self._error_message(error_buffer)
+                if status == self.NODE_NOT_FOUND:
+                    raise ValueError(message or "An OSM node was not found.")
+                if status == self.NO_PATH:
+                    raise RoadEngineError(
+                        message or "No directed road route exists."
+                    )
+                if status == self.MEMORY_ERROR:
+                    raise MemoryError(message or "Route allocation failed.")
+                raise RoadEngineError(
+                    message or f"Route operation failed: {status}"
+                )
 
-        return {
-            "nodes": nodes,
-            "node_count": len(nodes),
-            "distance_metres": total_distance.value,
-            "distance_km": total_distance.value / 1000.0,
-        }
+            try:
+                nodes = [
+                    int(route_pointer[index])
+                    for index in range(route_count.value)
+                ]
+            finally:
+                if route_pointer:
+                    self._dll.resqtech_free(route_pointer)
+
+            return {
+                "nodes": nodes,
+                "node_count": len(nodes),
+                "distance_metres": total_distance.value,
+                "distance_km": total_distance.value / 1000.0,
+            }
 
     def rank_resources(
         self,
         emergency_osm_id: int,
         candidates: list[dict],
     ) -> list[dict]:
-        self._ensure_open()
-
         if (
             isinstance(emergency_osm_id, bool)
             or not isinstance(emergency_osm_id, int)
@@ -254,69 +266,78 @@ class RoadEngine:
         resource_array = (ctypes.c_char_p * count)(*encoded_ids)
         base_array = (ctypes.c_uint64 * count)(*base_ids)
 
-        ranked_indices = ctypes.POINTER(ctypes.c_size_t)()
-        ranked_distances = ctypes.POINTER(ctypes.c_double)()
-        ranked_count = ctypes.c_size_t()
-        error_buffer = ctypes.create_string_buffer(512)
+        with self._lock:
+            self._ensure_open()
 
-        status = self._dll.resqtech_engine_rank_resources(
-            self._handle,
-            emergency_osm_id,
-            resource_array,
-            base_array,
-            count,
-            ctypes.byref(ranked_indices),
-            ctypes.byref(ranked_distances),
-            ctypes.byref(ranked_count),
-            error_buffer,
-            ctypes.sizeof(error_buffer),
-        )
+            ranked_indices = ctypes.POINTER(ctypes.c_size_t)()
+            ranked_distances = ctypes.POINTER(ctypes.c_double)()
+            ranked_count = ctypes.c_size_t()
+            error_buffer = ctypes.create_string_buffer(512)
 
-        if status != self.OK:
-            message = self._error_message(error_buffer)
-            if status == self.NODE_NOT_FOUND:
-                raise ValueError(message or "Emergency OSM node was not found.")
-            if status == self.MEMORY_ERROR:
-                raise MemoryError(message or "Resource ranking allocation failed.")
-            raise RoadEngineError(
-                message or f"Resource ranking failed with status {status}."
+            status = self._dll.resqtech_engine_rank_resources(
+                self._handle,
+                emergency_osm_id,
+                resource_array,
+                base_array,
+                count,
+                ctypes.byref(ranked_indices),
+                ctypes.byref(ranked_distances),
+                ctypes.byref(ranked_count),
+                error_buffer,
+                ctypes.sizeof(error_buffer),
             )
 
-        try:
-            results = []
-
-            for position in range(ranked_count.value):
-                original_index = int(ranked_indices[position])
-
-                if original_index >= count:
-                    raise RoadEngineError(
-                        "Native engine returned an invalid candidate index."
+            if status != self.OK:
+                message = self._error_message(error_buffer)
+                if status == self.NODE_NOT_FOUND:
+                    raise ValueError(
+                        message or "Emergency OSM node was not found."
                     )
-
-                results.append(
-                    {
-                        "resource_id": candidates[original_index]["resource_id"],
-                        "base_osm_id": base_ids[original_index],
-                        "distance_metres": ranked_distances[position],
-                        "distance_km": ranked_distances[position] / 1000.0,
-                    }
+                if status == self.MEMORY_ERROR:
+                    raise MemoryError(
+                        message or "Resource ranking allocation failed."
+                    )
+                raise RoadEngineError(
+                    message or f"Resource ranking failed with status {status}."
                 )
 
-            return results
+            try:
+                results = []
 
-        finally:
-            if ranked_indices:
-                self._dll.resqtech_free(ranked_indices)
-            if ranked_distances:
-                self._dll.resqtech_free(ranked_distances)
+                for position in range(ranked_count.value):
+                    original_index = int(ranked_indices[position])
+
+                    if original_index >= count:
+                        raise RoadEngineError(
+                            "Native engine returned an invalid candidate index."
+                        )
+
+                    results.append(
+                        {
+                            "resource_id": candidates[original_index]["resource_id"],
+                            "base_osm_id": base_ids[original_index],
+                            "distance_metres": ranked_distances[position],
+                            "distance_km": ranked_distances[position] / 1000.0,
+                        }
+                    )
+
+                return results
+
+            finally:
+                if ranked_indices:
+                    self._dll.resqtech_free(ranked_indices)
+                if ranked_distances:
+                    self._dll.resqtech_free(ranked_distances)
 
     def close(self) -> None:
-        if self._handle:
-            self._dll.resqtech_engine_destroy(self._handle)
-            self._handle = None
+        with self._lock:
+            if self._handle:
+                self._dll.resqtech_engine_destroy(self._handle)
+                self._handle = None
 
     def __enter__(self) -> RoadEngine:
-        self._ensure_open()
+        with self._lock:
+            self._ensure_open()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
